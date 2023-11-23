@@ -1,0 +1,418 @@
+---
+title: "Final_Report"
+author: "Team 23"
+output:
+  pdf_document:
+    keep_tex: true
+    latex_engine: pdflatex
+---
+
+```{r load-packages, message = FALSE,include=FALSE}
+library(knitr)
+library(tidyverse)
+library(broom)
+library(htmltools)
+library(skimr)
+library(rsample)
+library(tidymodels)
+library(randomForest)
+library(caret)
+library(countrycode)
+
+
+
+```
+
+
+
+
+```{r}
+kiva_joined_data_1 <- read.csv("/Users/eyal.benbarouch/Documents/kiva_data/kiva_joined_data.csv")
+
+#Taking only meaningful values
+kiva_joined_data <- kiva_joined_data_1 %>%
+  
+  mutate(defaulted = ifelse(kiva_joined_data_1$Status == "defaulted",1,0),
+         BORROWER_GENDERS = ifelse(kiva_joined_data_1$BORROWER_GENDERS == "male","male",ifelse(kiva_joined_data_1$BORROWER_GENDERS == "female","female","else"))) %>%
+  
+  select(-VIDEO_ID,-CURRENCY_EXCHANGE_COVERAGE_RATE,-PLANNED_EXPIRATION_TIME,-Country.Code,-Local.Currency,-Name,-Funded.Date.day.of.week,Funded.Date.day.of.month,Funded.Date.hour,Funded.Date.minute,Funded.Date.second,-Paid.Date.year,-Paid.Date.month,-Paid.Date.day.of.month,-Paid.Date.day.of.week,-Paid.Date.hour,-Paid.Date.minute,-Paid.Date.second,-LOAN_NAME,-ORIGINAL_LANGUAGE,-DESCRIPTION,-DESCRIPTION_TRANSLATED,-IMAGE_ID,-COUNTRY_CODE,-COUNTRY_NAME,-TOWN_NAME,-CURRENCY_POLICY,-BORROWER_PICTURED,-TAGS,-BORROWER_NAMES,-DISTRIBUTION_MODEL,-SECTOR_NAME,-id,-Funded.Date.minute,-Funded.Date.day.of.month,-Funded.Date.second,-Funded.Date.hour,-POSTED_TIME,-DISBURSE_TIME,-RAISED_TIME,-Funded.Date,-STATUS,-Paid.Date,-Use,-LOAN_USE,-Delinquent,-Status,-Paid.Amount)
+
+# Handleing NA values
+kiva_joined_data <- kiva_joined_data %>%
+  mutate(
+         Funded.Date.year= ifelse(is.na(Funded.Date.year),0,Funded.Date.year),
+         Funded.Date.month = ifelse(is.na(Funded.Date.month),0,Funded.Date.month),
+         LENDER_TERM= ifelse(is.na(LENDER_TERM),0,LENDER_TERM),
+         )
+
+
+# kiva_joined_data$defaulted <- as.factor(kiva_joined_data$defaulted)
+set.seed(1116)
+# Put 70% of the data into the training set 
+train_split <- initial_split(kiva_joined_data, prop = 0.7)
+# Create data frames for the two sets:
+train_data <- training(train_split)
+test_data  <- testing(train_split)
+```
+
+## Making a Workflow for the logistic regression model
+
+```{r}
+set.seed(123)
+sampled_data_1 <- train_data %>%
+  filter(defaulted == 1) %>%
+  sample_n(size = 1000)
+
+sampled_data_0 <- train_data %>%
+  filter(defaulted == 0) %>%
+  sample_n(size = 1000)
+
+sampled_data <- bind_rows(sampled_data_1,sampled_data_0)
+sampled_data$defaulted <-as.factor(sampled_data$defaulted)
+
+
+
+
+sample_fit <- logistic_reg() %>%
+  set_engine("glm") %>%
+  fit(defaulted ~ ., data = sampled_data, family = "binomial")
+
+sample_fit
+recipe_kiva <- recipe(defaulted ~ ., data = sampled_data) %>%
+  step_dummy(all_nominal_predictors()) %>%
+  step_normalize(all_numeric_predictors()) %>%
+  step_corr(all_numeric_predictors(),threshold = 0.85)
+
+kiva_fit <- logistic_reg() %>%
+      set_engine("glm")
+
+kiva_wflow <- workflow() %>%
+  add_model(kiva_fit) %>%
+  add_recipe(recipe_kiva)
+
+sapply(lapply(sampled_data, unique), length)
+
+```
+
+### Making a Logistic Regression Model
+
+```{r}
+train_data$defaulted <- as.factor(train_data$defaulted)
+
+kiva_naive_fit <- kiva_wflow %>%
+  fit(sampled_data)
+
+kiva_naive_fit
+
+
+```
+
+## Eval Function
+
+```{r}
+set.seed(321) 
+test_sample <- test_data %>%
+  sample_n(size=1000)
+evaluate_model <- function(model_fitted, test_data) {
+  pred_roc <- predict(model_fitted, test_data, type = "prob") %>%
+    bind_cols(test_data %>% select(defaulted))
+  
+  pred_roc$defaulted <- as.factor(pred_roc$defaulted)
+  
+  pred <- predict(model_fitted, test_data) %>%
+    bind_cols(test_data %>% select(defaulted))
+  
+  pred$defaulted <- as.factor(pred$defaulted)
+  
+  cm <- conf_mat(pred,
+                 truth = defaulted,
+                 estimate = .pred_class) 
+  
+  sum <- summary(cm)
+  
+  cm_summary <- as_tibble(summary(cm))
+  cm_summary <- cm_summary[3]
+  accuracy <- cm_summary$.estimate[1]
+  precision <- cm_summary$.estimate[11]
+  recall <- cm_summary$.estimate[12]
+  f1_score <- cm_summary$.estimate[13]
+  
+  cat(sprintf("Accuracy: %.2f\n", accuracy))
+  cat(sprintf("Precision: %.2f\n", precision))
+  cat(sprintf("Recall: %.2f\n", recall))
+  cat(sprintf("F1 Score: %.2f\n", f1_score))
+  
+  roc <- roc(pred_roc$defaulted, pred_roc$.pred_1, levels = c("0", "1"))
+  auc <- auc(roc)
+  
+  cat(sprintf("AUC: %.2f\n", auc))
+  
+  plot(roc, main = "Logistic Regression ROC Curve")
+}
+
+```
+
+## Logistic Regression Model Eval
+
+```{r}
+evaluate_model(kiva_naive_fit,test_data = test_data)
+# kiva_naive_fit
+```
+
+## Random Forest Model
+
+```{r}
+
+rf_model <- randomForest(defaulted ~ ., data = sampled_data)
+
+preds_top <- predict(rf_model, newdata = test_data)
+
+
+test_data$defaulted <- as.factor(test_data$defaulted)
+
+conf_mat <- confusionMatrix(data = preds_top, reference = test_data$defaulted)
+recall <- conf_mat$byClass[6]
+precision <- conf_mat$byClass[5]
+f1_score <- conf_mat$byClass[7]
+accuracy <- conf_mat$overall[1]
+# Print the results
+cat("Accuracy:", accuracy, "\n")
+cat("Precision:", precision, "\n")
+cat("Recall:", recall, "\n")
+cat("F1 Score:", f1_score, "\n")
+
+varImpPlot(rf_model) 
+
+roc_curve(truth=test_sample$defaulted,.pred_1,event_level= "second") %>%
+  autoplot()
+
+```
+
+```{r}
+
+preds <- predict(rf_model, newdata = test_data, type = "prob")
+roc_obj <- roc(test_data$defaulted, preds[, 2])
+roc_obj  # Print ROC object information
+plot(roc_obj, main = "Random Forest ROC Curve", print.auc = TRUE)  # Plot ROC curve
+```
+
+
+
+
+#Sub Question - is "wisdom of the crowd relevent in this case
+
+## Proportion of default rate per number of lenders
+
+```{r,warning=FALSE}
+num_defaulted_per_numlenders <- kiva_joined_data %>%
+  group_by(NUM_LENDERS_TOTAL) %>%
+  filter(Status == "defaulted") %>%
+  summarise(num_defualted = n())
+
+num_per_num_lenders <-  kiva_joined_data %>%
+  group_by(NUM_LENDERS_TOTAL) %>%
+  summarise(total_num_loans = n())
+
+num_total_vs_num_defaulted <- merge(num_per_num_lenders,num_defaulted_per_numlenders)
+
+num_total_vs_num_defaulted <- num_total_vs_num_defaulted %>%
+  mutate(prop_defaulted = num_defualted/total_num_loans)
+
+num_total_vs_num_defaulted %>%
+  filter(total_num_loans > 50) %>%
+  ggplot(aes(x = NUM_LENDERS_TOTAL, y = prop_defaulted)) +
+  geom_line(color = "steelblue", size = 0.7 ) +
+  geom_smooth(method = "loess", se = FALSE, color = "darkred", linetype = "solid") +
+  labs(title = "Proportion of defaulted loans by number of lenders",
+       x = "Number of lenders",
+       y = "Proportion of defaulted loans") +
+  theme_minimal()
+  
+
+
+```
+## Trying to explain jump after number of lenders = 80
+
+## Hypothesis 1 - Not enough data for Loans with over 80 num_total_lenders
+
+```{r}
+kiva_joined_data %>%
+  filter(NUM_LENDERS_TOTAL <150) %>%
+  group_by(NUM_LENDERS_TOTAL) %>%
+  summarise(count = n()) %>%
+  ggplot(aes(x = NUM_LENDERS_TOTAL, y = count)) +
+  geom_point()
+```
+
+
+
+## Hypothesis 2 - Checking if different Sectors in loans with over 80 num_lenders is the reason
+
+```{r}
+filtered_df_train <- kiva_joined_data %>%
+  mutate(Lenders_Greater_80 = ifelse(NUM_LENDERS_TOTAL >= 80, "Over 80", "Under 80"))
+
+
+
+counts <- filtered_df_train %>%
+  group_by(Lenders_Greater_80) %>%
+  count()
+
+count_over_80 <-counts$n[1]
+count_under_80 <-counts$n[2]
+
+ filtered_df_train %>%
+  group_by(Lenders_Greater_80, Sector) %>%
+  count() %>%
+  ungroup() %>%
+  mutate(percentage_of_loans = ifelse(Lenders_Greater_80 == "Over 80", n / count_over_80, n / count_under_80)) %>%
+  ggplot(aes(x=Sector,y=percentage_of_loans,fill = Lenders_Greater_80 )) +
+  geom_col(position = "dodge") +
+  labs(x = "Sector", y = "Normalized Count", title = "Normalized Counts of Sectors") +
+  facet_wrap(~ Lenders_Greater_80, ncol = 1) +
+  scale_fill_manual(values = c("Over 80" = "skyblue", "Under 80" = "black")) +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+
+
+
+```
+### The Distrubtion is very similar with sectors over 80 and under 80
+
+
+## Hypothesis 3 - Checking if different Continents in loans with over 80 num_lenders is the reason for the sudden jump in default rate
+
+
+```{r,warning=FALSE}
+continent_lookup <- data.frame(countrycode::codelist$iso2c, countrycode::codelist$region)
+
+
+colnames(continent_lookup) <- c("country_code", "continent")
+
+filtered_df_train <- kiva_joined_data_1 %>%
+  mutate(defaulted = ifelse(kiva_joined_data_1$Status == "defaulted",1,0)) %>%
+  left_join(continent_lookup, by = c("COUNTRY_CODE" = "country_code")) %>%
+  mutate(Lenders_Greater_80 = ifelse(NUM_LENDERS_TOTAL >= 80, "Over 80", "Under 80"))
+
+continent_default_rate <- filtered_df_train %>%
+  group_by(continent) %>%
+  summarize(default_rate = mean(defaulted == 1, na.rm = TRUE)) %>%
+  arrange(default_rate) %>% # Order by default rate in ascending order
+  na.omit() 
+
+ggplot(continent_default_rate, aes(x = reorder(continent, default_rate), y = default_rate)) +
+  geom_bar(stat = "identity", fill = "orange") +
+  labs(x = "Continent", y = "Default Rate", title = "Default Rate by Continent") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+filtered_df_train %>%
+  group_by(Lenders_Greater_80, continent) %>%
+  count() %>%
+  ungroup() %>%
+  mutate(percentage_of_loans = ifelse(Lenders_Greater_80 == "Over 80", n / count_over_80, n / count_under_80)) %>%
+  ggplot(aes(x = continent, y = percentage_of_loans, fill = Lenders_Greater_80)) +
+  geom_col(position = "dodge") +
+  labs(x = "Continent", y = "Percentage of Loans", title = "Normalized Counts of Loans by Continent") +
+  facet_wrap(~ Lenders_Greater_80, ncol = 1) +
+  scale_fill_manual(values = c("Over 80" = "skyblue", "Under 80" = "lightgray")) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+
+
+
+```
+## as seen from the graph Default rate by Continent - East Asia & Pacific have very low default rate , in loans with under 80 lenders the rate of loans from East Asia is much higher than loans with over 80 lenders - may be the cause , also North America and Sub Sahrain are higher in loans with over 80 lenders
+
+
+## Hypothesis 4 - Checking if increase of loan amounts in loans with over 80 lenders may be the reason in the increase
+
+```{r}
+# Calculate the average loan amount for each num_lenders_total
+average_loan <- kiva_joined_data %>%
+  group_by(NUM_LENDERS_TOTAL) %>%
+  summarize(avg_loan_amount = mean(LOAN_AMOUNT))
+
+# Create a scatter plot with different colors for num_lenders_total < 80 and >= 80
+ ggplot(average_loan, aes(x = NUM_LENDERS_TOTAL, y = avg_loan_amount)) +
+  geom_point(aes(color = ifelse(NUM_LENDERS_TOTAL < 80, "Under", "Over"))) +
+  labs(x = "Number of Lenders", y = "Average Loan Amount",color = "Over or Under 80?") +
+  ggtitle("Average Loan Amount per Number of Lenders") +
+  scale_color_manual(values = c("Under" = "blue", "Over" = "red")) +
+  theme_minimal() +
+  coord_cartesian(xlim = c(0, 200),
+                  ylim = c(0,6000))
+
+
+```
+
+
+
+```{r}
+# Calculate the average loan amount for deals with num_lenders_total < 80 and > 80
+average_loan <- kiva_joined_data %>%
+  mutate(lender_group = ifelse(NUM_LENDERS_TOTAL < 80, "Under", "Over")) %>%
+  group_by(lender_group) %>%
+  summarize(avg_loan_amount = mean(LOAN_AMOUNT))
+
+# Create a bar plot comparing the average loan amount
+ ggplot(average_loan, aes(x = lender_group, y = avg_loan_amount, fill = lender_group)) +
+  geom_bar(stat = "identity", width = 0.5) +
+  labs(x = "Number of Lenders", y = "Average Loan Amount", fill = "Number of Lenders") +
+  ggtitle("Average Loan Amount for Different Number of Lenders") +
+  theme_minimal()
+
+
+```
+
+
+```{r,warning=FALSE}
+kiva_data_for_loan_amt_graph <- kiva_joined_data %>%
+  mutate(group = ifelse(LOAN_AMOUNT <= 2800, "Num_Lenders under 80 mean", "Num_Lenders over 80 mean")) %>%
+  group_by(group) %>%
+  summarize(default_rate = mean(defaulted, na.rm = TRUE),
+            count = n()) %>%
+  na.omit()
+
+
+ggplot(kiva_data_for_loan_amt_graph, aes(x = group, y = default_rate, fill = group)) +
+  geom_bar(stat = "identity", color = "black") +
+  labs(x = "Loan Amount Group", y = "Default Rate") +
+  ggtitle("Default Rate and Count by Loan Amount Groups") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+
+
+kiva_data <- kiva_joined_data %>%
+  mutate(group = ifelse(Loan.Amount <= 2800, "0 to 2800", "2800 to inf")) %>%
+  group_by(group, defaulted) %>%
+  summarize(count = n()) %>%
+  spread(defaulted, count, fill = 0) %>%
+  na.omit()
+
+kiva_data <- kiva_data %>%
+  mutate(total = `0` + `1`,
+         default_rate = `1` / total,
+         not_defaulted_rate = `0` / total)
+
+kiva_data
+  
+```
+
+
+
+
+```{r setup, include = FALSE}
+opts_chunk$set(echo=FALSE) # hide source code in the document
+```
+
+
+
+
+
+### Source code
+\color{blue}
+```{r, ref.label=knitr::all_labels(), echo=TRUE, eval=FALSE}
+```
